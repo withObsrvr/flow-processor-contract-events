@@ -80,6 +80,7 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 	}
 	defer txReader.Close()
 
+	// Process each transaction
 	for {
 		tx, err := txReader.Read()
 		if err == io.EOF {
@@ -89,12 +90,14 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 			return fmt.Errorf("error reading transaction: %w", err)
 		}
 
+		// Get diagnostic events from transaction
 		diagnosticEvents, err := tx.GetDiagnosticEvents()
 		if err != nil {
 			log.Printf("Error getting diagnostic events: %v", err)
 			continue
 		}
 
+		// Process events
 		for opIdx, events := range filterContractEvents(diagnosticEvents) {
 			for eventIdx, event := range events {
 				contractEvent, err := p.processContractEvent(tx, opIdx, eventIdx, event, ledgerCloseMeta)
@@ -104,6 +107,9 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 				}
 
 				if contractEvent != nil {
+					// Add debug logging
+					log.Printf("Found contract event for contract ID: %s", contractEvent.ContractID)
+
 					if err := p.forwardToConsumers(ctx, contractEvent); err != nil {
 						log.Printf("Error forwarding event: %v", err)
 					}
@@ -112,16 +118,13 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 		}
 	}
 
-	p.mu.Lock()
-	p.stats.ProcessedLedgers++
-	p.stats.LastLedger = sequence
-	p.stats.LastProcessedTime = time.Now()
-	p.mu.Unlock()
-
 	return nil
 }
 
 func (p *ContractEventProcessor) forwardToConsumers(ctx context.Context, event *ContractEvent) error {
+	// Add debug logging
+	log.Printf("Forwarding event to %d consumers", len(p.consumers))
+
 	jsonBytes, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("error marshaling event: %w", err)
@@ -137,6 +140,7 @@ func (p *ContractEventProcessor) forwardToConsumers(ctx context.Context, event *
 	}
 
 	for _, consumer := range p.consumers {
+		log.Printf("Forwarding to consumer: %s", consumer.Name())
 		if err := consumer.Process(ctx, msg); err != nil {
 			return fmt.Errorf("error in consumer %s: %w", consumer.Name(), err)
 		}
