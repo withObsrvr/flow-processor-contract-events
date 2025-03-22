@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,117 @@ import (
 	"github.com/stellar/go/xdr"
 	"github.com/withObsrvr/pluginapi"
 )
+
+// ErrorType defines the category of an error
+type ErrorType string
+
+const (
+	// Configuration errors
+	ErrorTypeConfig ErrorType = "config"
+	// Network-related errors
+	ErrorTypeNetwork ErrorType = "network"
+	// Data parsing errors
+	ErrorTypeParsing ErrorType = "parsing"
+	// Event processing errors
+	ErrorTypeProcessing ErrorType = "processing"
+	// Consumer-related errors
+	ErrorTypeConsumer ErrorType = "consumer"
+)
+
+// ErrorSeverity defines how critical an error is
+type ErrorSeverity string
+
+const (
+	// Fatal errors that should stop processing
+	ErrorSeverityFatal ErrorSeverity = "fatal"
+	// Errors that can be logged but processing can continue
+	ErrorSeverityWarning ErrorSeverity = "warning"
+	// Informational issues that might be useful for debugging
+	ErrorSeverityInfo ErrorSeverity = "info"
+)
+
+// ProcessorError represents a structured error with context
+type ProcessorError struct {
+	// Original error
+	Err error
+	// Type categorizes the error
+	Type ErrorType
+	// Severity indicates how critical the error is
+	Severity ErrorSeverity
+	// Transaction hash related to the error, if applicable
+	TransactionHash string
+	// Ledger sequence related to the error, if applicable
+	LedgerSequence uint32
+	// Contract ID related to the error, if applicable
+	ContractID string
+	// Additional context as key-value pairs
+	Context map[string]interface{}
+}
+
+// Error satisfies the error interface
+func (e *ProcessorError) Error() string {
+	contextStr := ""
+	for k, v := range e.Context {
+		contextStr += fmt.Sprintf(" %s=%v", k, v)
+	}
+
+	idInfo := ""
+	if e.TransactionHash != "" {
+		idInfo += fmt.Sprintf(" tx=%s", e.TransactionHash)
+	}
+	if e.LedgerSequence > 0 {
+		idInfo += fmt.Sprintf(" ledger=%d", e.LedgerSequence)
+	}
+	if e.ContractID != "" {
+		idInfo += fmt.Sprintf(" contract=%s", e.ContractID)
+	}
+
+	return fmt.Sprintf("[%s:%s]%s%s: %v", e.Type, e.Severity, idInfo, contextStr, e.Err)
+}
+
+// Unwrap returns the original error
+func (e *ProcessorError) Unwrap() error {
+	return e.Err
+}
+
+// IsFatal returns true if the error is fatal
+func (e *ProcessorError) IsFatal() bool {
+	return e.Severity == ErrorSeverityFatal
+}
+
+// NewProcessorError creates a new processor error
+func NewProcessorError(err error, errType ErrorType, severity ErrorSeverity) *ProcessorError {
+	return &ProcessorError{
+		Err:      err,
+		Type:     errType,
+		Severity: severity,
+		Context:  make(map[string]interface{}),
+	}
+}
+
+// WithTransaction adds transaction information to the error
+func (e *ProcessorError) WithTransaction(hash string) *ProcessorError {
+	e.TransactionHash = hash
+	return e
+}
+
+// WithLedger adds ledger information to the error
+func (e *ProcessorError) WithLedger(sequence uint32) *ProcessorError {
+	e.LedgerSequence = sequence
+	return e
+}
+
+// WithContract adds contract information to the error
+func (e *ProcessorError) WithContract(id string) *ProcessorError {
+	e.ContractID = id
+	return e
+}
+
+// WithContext adds additional context to the error
+func (e *ProcessorError) WithContext(key string, value interface{}) *ProcessorError {
+	e.Context[key] = value
+	return e
+}
 
 // ContractEvent represents an event emitted by a contract with both raw and decoded data
 type ContractEvent struct {
@@ -91,21 +203,49 @@ type ContractEventProcessor struct {
 func (p *ContractEventProcessor) Initialize(config map[string]interface{}) error {
 	networkPassphrase, ok := config["network_passphrase"].(string)
 	if !ok {
-		return fmt.Errorf("missing network_passphrase in configuration")
+		return NewProcessorError(
+			errors.New("missing network_passphrase in configuration"),
+			ErrorTypeConfig,
+			ErrorSeverityFatal,
+		)
 	}
+
+	if networkPassphrase == "" {
+		return NewProcessorError(
+			errors.New("network_passphrase cannot be empty"),
+			ErrorTypeConfig,
+			ErrorSeverityFatal,
+		)
+	}
+
 	p.networkPassphrase = networkPassphrase
 	return nil
 }
 
 func (p *ContractEventProcessor) RegisterConsumer(consumer pluginapi.Consumer) {
 	log.Printf("ContractEventProcessor: Registering consumer %s", consumer.Name())
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.consumers = append(p.consumers, consumer)
 }
 
 func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Message) error {
+	// Check for canceled context before starting work
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before processing: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityFatal,
+		)
+	}
+
 	ledgerCloseMeta, ok := msg.Payload.(xdr.LedgerCloseMeta)
 	if !ok {
-		return fmt.Errorf("expected xdr.LedgerCloseMeta, got %T", msg.Payload)
+		return NewProcessorError(
+			fmt.Errorf("expected xdr.LedgerCloseMeta, got %T", msg.Payload),
+			ErrorTypeParsing,
+			ErrorSeverityFatal,
+		)
 	}
 
 	sequence := ledgerCloseMeta.LedgerSequence()
@@ -113,33 +253,85 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 
 	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(p.networkPassphrase, ledgerCloseMeta)
 	if err != nil {
-		return fmt.Errorf("error creating transaction reader: %w", err)
+		return NewProcessorError(
+			fmt.Errorf("error creating transaction reader: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityFatal,
+		).WithLedger(sequence)
 	}
 	defer txReader.Close()
 
-	// Process each transaction
+	// Process each transaction with context handling
 	for {
+		// Check for context cancellation periodically
+		if err := ctx.Err(); err != nil {
+			return NewProcessorError(
+				fmt.Errorf("context canceled during processing: %w", err),
+				ErrorTypeProcessing,
+				ErrorSeverityFatal,
+			).WithLedger(sequence)
+		}
+
 		tx, err := txReader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("error reading transaction: %w", err)
+			// Continue processing despite transaction read errors
+			procErr := NewProcessorError(
+				fmt.Errorf("error reading transaction: %w", err),
+				ErrorTypeProcessing,
+				ErrorSeverityWarning,
+			).WithLedger(sequence)
+			log.Printf("Warning: %s", procErr.Error())
+			continue
 		}
+
+		txHash := tx.Result.TransactionHash.HexString()
 
 		// Get diagnostic events from transaction
 		diagnosticEvents, err := tx.GetDiagnosticEvents()
 		if err != nil {
-			log.Printf("Error getting diagnostic events: %v", err)
+			procErr := NewProcessorError(
+				fmt.Errorf("error getting diagnostic events: %w", err),
+				ErrorTypeProcessing,
+				ErrorSeverityWarning,
+			).WithLedger(sequence).WithTransaction(txHash)
+			log.Printf("Warning: %s", procErr.Error())
 			continue
 		}
 
 		// Process events
 		for opIdx, events := range filterContractEvents(diagnosticEvents) {
 			for eventIdx, event := range events {
-				contractEvent, err := p.processContractEvent(tx, opIdx, eventIdx, event, ledgerCloseMeta)
+				// Process with context timeout for individual event processing
+				eventCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				contractEvent, err := p.processContractEvent(eventCtx, tx, opIdx, eventIdx, event, ledgerCloseMeta)
+				cancel() // Always cancel to avoid context leak
+
 				if err != nil {
-					log.Printf("Error processing contract event: %v", err)
+					var procErr *ProcessorError
+					if !errors.As(err, &procErr) {
+						// Wrap the error if it's not already a ProcessorError
+						procErr = NewProcessorError(
+							err,
+							ErrorTypeProcessing,
+							ErrorSeverityWarning,
+						)
+					}
+
+					procErr.WithLedger(sequence).WithTransaction(txHash)
+					if event.ContractId != nil {
+						contractIdByte, _ := event.ContractId.MarshalBinary()
+						contractID, _ := strkey.Encode(strkey.VersionByteContract, contractIdByte)
+						procErr.WithContract(contractID)
+					}
+
+					procErr.WithContext("event_index", eventIdx).
+						WithContext("operation_index", opIdx)
+
+					log.Printf("Error processing contract event: %s", procErr.Error())
+
 					p.mu.Lock()
 					p.stats.FailedEvents++
 					p.mu.Unlock()
@@ -157,8 +349,29 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 					}
 					p.mu.Unlock()
 
-					if err := p.forwardToConsumers(ctx, contractEvent); err != nil {
-						log.Printf("Error forwarding event: %v", err)
+					// Forward with context timeout for consumer processing
+					consumerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					err := p.forwardToConsumers(consumerCtx, contractEvent)
+					cancel() // Always cancel to avoid context leak
+
+					if err != nil {
+						var procErr *ProcessorError
+						if !errors.As(err, &procErr) {
+							// Wrap if not already a ProcessorError
+							procErr = NewProcessorError(
+								err,
+								ErrorTypeConsumer,
+								ErrorSeverityWarning,
+							)
+						}
+
+						procErr.WithLedger(sequence).
+							WithTransaction(txHash).
+							WithContract(contractEvent.ContractID).
+							WithContext("event_index", eventIdx).
+							WithContext("operation_index", opIdx)
+
+						log.Printf("Error forwarding event: %s", procErr.Error())
 					}
 				}
 			}
@@ -176,12 +389,25 @@ func (p *ContractEventProcessor) Process(ctx context.Context, msg pluginapi.Mess
 }
 
 func (p *ContractEventProcessor) forwardToConsumers(ctx context.Context, event *ContractEvent) error {
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before forwarding: %w", err),
+			ErrorTypeConsumer,
+			ErrorSeverityWarning,
+		)
+	}
+
 	// Add debug logging
 	log.Printf("Forwarding event to %d consumers", len(p.consumers))
 
 	jsonBytes, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("error marshaling event: %w", err)
+		return NewProcessorError(
+			fmt.Errorf("error marshaling event: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		)
 	}
 
 	msg := pluginapi.Message{
@@ -195,10 +421,35 @@ func (p *ContractEventProcessor) forwardToConsumers(ctx context.Context, event *
 		},
 	}
 
-	for _, consumer := range p.consumers {
+	// Lock to safely access p.consumers
+	p.mu.RLock()
+	consumers := make([]pluginapi.Consumer, len(p.consumers))
+	copy(consumers, p.consumers)
+	p.mu.RUnlock()
+
+	for _, consumer := range consumers {
+		// Check context before each consumer to allow early exit
+		if err := ctx.Err(); err != nil {
+			return NewProcessorError(
+				fmt.Errorf("context canceled during forwarding: %w", err),
+				ErrorTypeConsumer,
+				ErrorSeverityWarning,
+			)
+		}
+
 		log.Printf("Forwarding to consumer: %s", consumer.Name())
-		if err := consumer.Process(ctx, msg); err != nil {
-			return fmt.Errorf("error in consumer %s: %w", consumer.Name(), err)
+
+		// Create a consumer-specific timeout context
+		consumerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := consumer.Process(consumerCtx, msg)
+		cancel() // Always cancel to prevent context leak
+
+		if err != nil {
+			return NewProcessorError(
+				fmt.Errorf("error in consumer %s: %w", consumer.Name(), err),
+				ErrorTypeConsumer,
+				ErrorSeverityWarning,
+			).WithContext("consumer", consumer.Name())
 		}
 	}
 	return nil
@@ -237,21 +488,40 @@ func filterContractEvents(diagnosticEvents []xdr.DiagnosticEvent) map[int][]xdr.
 }
 
 func (p *ContractEventProcessor) processContractEvent(
+	ctx context.Context,
 	tx ingest.LedgerTransaction,
 	opIndex, eventIndex int,
 	event xdr.ContractEvent,
 	meta xdr.LedgerCloseMeta,
 ) (*ContractEvent, error) {
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return nil, NewProcessorError(
+			fmt.Errorf("context canceled while processing event: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		).WithContext("event_index", eventIndex).
+			WithContext("operation_index", opIndex)
+	}
+
 	// Extract contract ID
 	var contractID string
 	if event.ContractId != nil {
 		contractIdByte, err := event.ContractId.MarshalBinary()
 		if err != nil {
-			return nil, fmt.Errorf("error marshaling contract ID: %w", err)
+			return nil, NewProcessorError(
+				fmt.Errorf("error marshaling contract ID: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityWarning,
+			)
 		}
 		contractID, err = strkey.Encode(strkey.VersionByteContract, contractIdByte)
 		if err != nil {
-			return nil, fmt.Errorf("error encoding contract ID: %w", err)
+			return nil, NewProcessorError(
+				fmt.Errorf("error encoding contract ID: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityWarning,
+			)
 		}
 	}
 
@@ -273,13 +543,21 @@ func (p *ContractEventProcessor) processContractEvent(
 		topics = v0.Topics
 		eventData = v0.Data
 	} else {
-		return nil, fmt.Errorf("unsupported event body version: %d", event.Body.V)
+		return nil, NewProcessorError(
+			fmt.Errorf("unsupported event body version: %d", event.Body.V),
+			ErrorTypeParsing,
+			ErrorSeverityWarning,
+		).WithContext("event_body_version", event.Body.V)
 	}
 
 	// Convert event XDR to base64
 	eventXDR, err := xdr.MarshalBase64(event)
 	if err != nil {
-		return nil, fmt.Errorf("error marshaling event XDR: %w", err)
+		return nil, NewProcessorError(
+			fmt.Errorf("error marshaling event XDR: %w", err),
+			ErrorTypeParsing,
+			ErrorSeverityWarning,
+		)
 	}
 
 	// Serialize topics and data
@@ -332,6 +610,15 @@ func (p *ContractEventProcessor) processContractEvent(
 	if err == nil {
 		var diagnosticData []DiagnosticData
 		for _, diagEvent := range diagnosticEvents {
+			// Check for context cancellation periodically
+			if err := ctx.Err(); err != nil {
+				return nil, NewProcessorError(
+					fmt.Errorf("context canceled while processing diagnostic events: %w", err),
+					ErrorTypeProcessing,
+					ErrorSeverityWarning,
+				)
+			}
+
 			if diagEvent.Event.Type == xdr.ContractEventTypeContract {
 				eventData, err := json.Marshal(diagEvent.Event)
 				if err != nil {
