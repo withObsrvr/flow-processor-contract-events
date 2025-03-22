@@ -7,12 +7,6 @@ require (
 	github.com/withObsrvr/pluginapi v0.0.0-20250303141549-e645e333195c
 )
 
-replace (
-	cloud.google.com/go/storage => cloud.google.com/go/storage v1.50.0
-	golang.org/x/sys => golang.org/x/sys v0.31.0
-	google.golang.org/grpc => google.golang.org/grpc v1.71.0
-)
-
 exclude google.golang.org/grpc/stats/opentelemetry v0.0.0-20241028142157-ada6787961b3
 
 require (
