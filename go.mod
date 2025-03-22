@@ -8,7 +8,6 @@ require (
 )
 
 replace (
-	cloud.google.com/go => cloud.google.com/go v0.119.0
 	cloud.google.com/go/storage => cloud.google.com/go/storage v1.50.0
 	golang.org/x/sys => golang.org/x/sys v0.31.0
 	google.golang.org/grpc => google.golang.org/grpc v1.71.0
@@ -18,7 +17,7 @@ exclude google.golang.org/grpc/stats/opentelemetry v0.0.0-20241028142157-ada6787
 
 require (
 	cel.dev/expr v0.22.0 // indirect
-	cloud.google.com/go v0.120.0 // indirect
+	cloud.google.com/go v0.119.0 // indirect
 	cloud.google.com/go/auth v0.15.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.7 // indirect
 	cloud.google.com/go/compute/metadata v0.6.0 // indirect

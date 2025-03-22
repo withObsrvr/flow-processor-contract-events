@@ -1,7 +1,7 @@
 # cel.dev/expr v0.22.0
 ## explicit; go 1.21.1
 cel.dev/expr
-# cloud.google.com/go v0.120.0 => cloud.google.com/go v0.119.0
+# cloud.google.com/go v0.119.0
 ## explicit; go 1.23.0
 cloud.google.com/go/internal
 cloud.google.com/go/internal/optional
@@ -741,7 +741,6 @@ gopkg.in/djherbis/stream.v1
 gopkg.in/yaml.v3
 # moul.io/http2curl v1.0.0
 ## explicit
-# cloud.google.com/go => cloud.google.com/go v0.119.0
 # cloud.google.com/go/storage => cloud.google.com/go/storage v1.50.0
 # golang.org/x/sys => golang.org/x/sys v0.31.0
 # google.golang.org/grpc => google.golang.org/grpc v1.71.0
