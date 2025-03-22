@@ -9,6 +9,7 @@ require (
 
 replace (
 	cloud.google.com/go => cloud.google.com/go v0.119.0
+	cloud.google.com/go/auth/oauth2adapt => cloud.google.com/go/auth/oauth2adapt v0.2.7
 	cloud.google.com/go/storage => cloud.google.com/go/storage v1.50.0
 	golang.org/x/sys => golang.org/x/sys v0.31.0
 	google.golang.org/api => google.golang.org/api v0.223.0
